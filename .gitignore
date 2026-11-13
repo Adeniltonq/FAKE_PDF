@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+saida/
+*.pdf
+!docs/
+*.tmp
+.venv/
+venv/
+.DS_Store
+Thumbs.db
+relatorio*.txt
