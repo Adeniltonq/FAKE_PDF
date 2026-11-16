@@ -4,6 +4,9 @@ Programa em **Python puro (só a biblioteca padrão)** para criar PDFs de teste:
 
 1. **Embaralhar páginas** — pega PDFs que já existem, sorteia e redistribui as páginas em novos arquivos.
 2. **Meus textos + minhas fotos** — gera PDFs com o texto e as fotos que você informar (sorteando layout, tamanho e páginas).
+   - **Sorteio do conteúdo**: corta as frases em pedaços, remonta, repete e intercala as fotos
+     (inteiras e recortadas) até preencher **exatamente** o número de páginas pedido
+     (10, 100, 200...), com quantos PDFs você quiser.
 3. **Aleatório automático** — cria PDFs do zero com textos aleatórios em português, no tamanho que você quiser.
 
 Não precisa de `pip install`. Funciona em **Linux, Windows e macOS**, com interface **Tkinter** no computador e **modo terminal** (teclado) no celular/Termux, SSH e servidores.
@@ -41,11 +44,17 @@ python gerador_pdf.py --cli misturar a.pdf b.pdf -p 12 -n 3
 # 2) usar meus textos e minhas fotos
 python gerador_pdf.py --cli texto --texto cartas.txt --foto foto1.jpg --foto foto2.png -p 4 --pdfs 5
 
+# 2b) sorteio do conteúdo: 20 PDFs de 100 páginas com frases cortadas/repetidas + fotos
+python gerador_pdf.py --cli texto --texto cartas.txt --foto ./fotos/ --sorteio -p 100 --pdfs 20
+
 # 3) PDFs aleatórios automáticos, com tamanho sorteado
 python gerador_pdf.py --cli aleatorio --pdfs 10 -p 3 --aleatorio-tamanho --largura-min 80 --largura-max 200
 ```
 
-Opções úteis: `-o PASTA` (saída), `--tamanho A4|A5|A3|Letter|10x15cm|210x297mm|400x600pt`,
+Opções do sorteio: `--sorteio`, `--recortes N` (versões recortadas de cada foto),
+`--so-meu-texto` (não mistura frases aleatórias), `--semente N` (repete o mesmo resultado).
+
+Opções úteis: `-o PASTA` (saída), `--tamanho A4|A5|A6|A3|B5|Letter|Legal|10x15cm|210x297mm|400x600pt`,
 `--aleatorio-tamanho`, `--aleatorio-paginas MIN MAX`, `--marca-dagua TEXTO`, `--fonte-serif`,
 `--sem-repetir`, `--nao-aleatorizar`.
 

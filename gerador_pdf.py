@@ -1681,15 +1681,27 @@ def wrap_text(text, font, size, max_width):
 # =============================================================================
 
 PAGE_SIZES = {
+    "A3": (841.89, 1190.55),
     "A4": (595.28, 841.89),
     "A5": (419.53, 595.28),
-    "A3": (841.89, 1190.55),
+    "A6": (297.64, 419.53),
+    "A7": (209.76, 297.64),
+    "B5": (498.90, 708.66),
     "Letter": (612.0, 792.0),
     "Legal": (612.0, 1008.0),
     "Ficha (caderno 90x140mm)": (255.12, 396.85),
     "Quadrada 20x20cm": (566.93, 566.93),
     "Retrato 10x15cm": (283.46, 425.20),
     "Tira 10x25cm": (283.46, 708.66),
+}
+
+# apelidos aceitos pela linha de comando e pelo campo de tamanho
+_SIZE_ALIASES = {
+    "a3": "A3", "a4": "A4", "a5": "A5", "a6": "A6", "a7": "A7", "b5": "B5",
+    "carta": "Letter", "letter": "Letter", "oficio": "Legal", "legal": "Legal",
+    "ficha": "Ficha (caderno 90x140mm)", "caderno": "Ficha (caderno 90x140mm)",
+    "quadrada": "Quadrada 20x20cm", "quadrado": "Quadrada 20x20cm",
+    "retrato": "Retrato 10x15cm", "10x15": "Retrato 10x15cm", "tira": "Tira 10x25cm",
 }
 
 FONT_NAMES = {
@@ -1735,9 +1747,11 @@ def resolve_page_size(spec, rng):
     if low in ("", "aleatorio", "aleatoria", "random", "auto"):
         return random_size(rng)
     landscape = "paisagem" in low or "landscape" in low
-    portrait = "retrato" in low or "portrait" in low
-    for key in PAGE_SIZES:
-        if strip_accents(key.split(" ")[0]).lower() in low:
+    portrait = "portrait" in low
+    cleaned = re.sub(r"[^a-z0-9x.]", " ", low)
+    for token in cleaned.split():
+        key = _SIZE_ALIASES.get(token)
+        if key:
             w, h = PAGE_SIZES[key]
             if landscape and not portrait:
                 return h, w
@@ -1776,11 +1790,24 @@ class PageSink:
         return fonts
 
     def image_ref(self, writer, info):
-        key = (info.get("path"), info["width"], info["height"], info["filter"])
+        crop = info.get("crop")
+        key = (info.get("path"), info["width"], info["height"], info["filter"], crop, info["data"])
         cached = self._images.get(key)
         if cached is not None:
             return cached
         data = info["data"]
+        if crop:
+            full_w = info.get("full_width", info["width"])
+            full_h = info.get("full_height", info["height"])
+            channels = _COLOR_CHANNELS.get(info["colorspace"], 3)  # noqa: F821 (definido abaixo)
+            if info["filter"] != "DCTDecode":
+                x0, y0, x1, y1 = crop
+                cw, ch = info["width"], info["height"]
+                rows = []
+                for y in range(ch):
+                    start = ((y0 + y) * full_w + x0) * channels
+                    rows.append(data[start:start + cw * channels])
+                data = b"".join(rows)
         d = {
             "Type": Name("XObject"),
             "Subtype": Name("Image"),
@@ -1893,7 +1920,25 @@ class PageBuilder:
     def image(self, info, x, y_top, w, h):
         name = "Im%d" % (len(self.images) + 1)
         self.images[name] = info
-        self.ops += b"q\n%.2f 0 0 %.2f %.2f %.2f cm\n/%s Do\nQ\n" % (w, h, x, y_top - h, name.encode())
+        crop = info.get("crop")
+        if crop:
+            # mostra apenas a região recortada, esticada na área pedida
+            iw = info.get("full_width", info["width"])
+            x0, y0, x1, y1 = crop
+            cw, ch = info["width"], info["height"]
+            scale_x = w / float(cw)
+            scale_y = h / float(ch)
+            self.ops += b"q\n"
+            self.ops += ("%.2f 0 0 %.2f %.2f %.2f re W n\n" % (x, h, x, y_top - h)).encode()
+            self.ops += ("%.2f 0 0 %.2f %.2f %.2f cm\n" % (
+                w * iw / float(x1 - x0), scale_y,
+                x - x0 * scale_x,
+                (y_top - h) - (info.get("full_height", ch) - y1) * scale_y,
+            )).encode()
+            self.ops += b"/%s Do\nQ\n" % name.encode()
+        else:
+            self.ops += b"q\n%.2f 0 0 %.2f %.2f %.2f cm\n/%s Do\nQ\n" % (
+                w, h, x, y_top - h, name.encode())
         return name
 
     def fit_image(self, info, x, y_top, max_w, max_h):
@@ -1911,6 +1956,9 @@ class PageBuilder:
 
     def content(self):
         return bytes(self.ops)
+
+
+_COLOR_CHANNELS = {"DeviceGray": 1, "DeviceRGB": 3, "DeviceCMYK": 4}
 
 
 def _image_list(images):
@@ -1936,6 +1984,118 @@ def _content_pool(texts, rng):
     if not pool:
         pool = [random_paragraph(rng) for _ in range(6)]
     return pool
+
+
+class ContentDeck:
+    """Pilha de conteúdo em que frases e fotos são cortadas, misturadas e repetidas.
+
+    Usada no modo "sorteio de conteúdo": o mesmo material do usuário rende
+    quantas páginas forem pedidas (10, 100, 500...), sempre remontado de
+    forma diferente, com as fotos entrando no meio dos textos.
+    """
+
+    def __init__(self, texts, capture_boxes, rng, opts):
+        self.rng = rng
+        self.fragments = []
+        self.images = []
+        self._build_segments(texts, capture_boxes)
+        self.images = [box["info"] for box in (capture_boxes or [])]
+        self.use_original = opts.get("use_original_texts", True)
+        self.filler_p = float(opts.get("filler_prob", 0.35))
+        self._bag = []
+        self._img_bag = []
+
+    # -- preparação ---------------------------------------------------------
+    def _build_segments(self, texts, capture_boxes):
+        for text in texts or []:
+            text = str(text).replace("\r\n", "\n").replace("\r", "\n")
+            for block in re.split(r"\n\s*\n", text):
+                block = " ".join(block.split())
+                if not block:
+                    continue
+                self.fragments.append(("orig", block))
+                for sentence in re.split(r"(?<=[.!?…])\s+", block):
+                    sentence = sentence.strip()
+                    if len(sentence) >= 18:
+                        self.fragments.append(("orig", sentence))
+
+    # -- sorteio ------------------------------------------------------------
+    def next_piece(self, allow_image=True, force_image=False):
+        rng = self.rng
+        if force_image and self.images:
+            return ("img", self.next_image())
+        if rng.random() < self.filler_p or not self.fragments:
+            piece = ("rand", random_sentence(rng))
+        else:
+            if not self._bag:
+                self._bag = list(self.fragments)
+                rng.shuffle(self._bag)
+            kind, text = self._bag.pop()
+            if kind == "orig" and rng.random() > 0.6:
+                text = _remix_sentence(text, rng)
+            piece = (kind, text)
+        if allow_image and self.images:
+            piece = ("img", self.next_image())
+        return piece
+
+    @property
+    def image_ratio(self):
+        return 0.22 if len(self.images) >= 6 else 0.16
+
+    def next_image(self):
+        rng = self.rng
+        if not self._img_bag:
+            self._img_bag = list(self.images)
+            rng.shuffle(self._img_bag)
+        return self._img_bag.pop()
+
+
+def _remix_sentence(text, rng):
+    """Corta o texto ao meio e junta pedaços diferentes (às vezes invertendo)."""
+    if len(text) < 60:
+        return text
+    a = rng.randint(len(text) // 3, 2 * len(text) // 3)
+    b = rng.randint(a, len(text) - 20)
+    cut = text[a:] if rng.random() < 0.5 else text[:b]
+    cut = cut.strip()
+    if rng.random() < 0.4:
+        cut = re.sub(r"\s+", " ", cut).rstrip(".!?…,;")
+    return cut
+
+
+def _crop_image(info, box):
+    """Recorta uma imagem (fração 0..1 de largura/altura) para a região pedida."""
+    try:
+        w, h = info["width"], info["height"]
+        x0 = max(0, min(w - 2, int(box[0] * w)))
+        y0 = max(0, min(h - 2, int(box[1] * h)))
+        x1 = max(x0 + 2, min(w, int(box[2] * w)))
+        y1 = max(y0 + 2, min(h, int(box[3] * h)))
+        if (x1 - x0) * (y1 - y0) < 64:
+            return None
+        out = dict(info)
+        out.setdefault("full_width", w)
+        out.setdefault("full_height", h)
+        out.update({"width": x1 - x0, "height": y1 - y0, "crop": (x0, y0, x1, y1)})
+        return out
+    except Exception:
+        return None
+
+
+def _image_crop_box(info, rng):
+    """Album 'recortado': parte de baixo, topo, esquerda, direita ou um miolo."""
+    pick = rng.random()
+    if pick < 0.22:
+        return (0.0, 0.45, 1.0, 1.0)
+    if pick < 0.44:
+        return (0.0, 0.0, 1.0, 0.55)
+    if pick < 0.62:
+        return (0.0, 0.0, 0.55, 1.0)
+    if pick < 0.80:
+        return (0.45, 0.0, 1.0, 1.0)
+    if pick < 0.90:
+        return (0.0, 0.0, 1.0, 1.0)
+    return (0.25, 0.25, 0.75, 0.75)
 
 
 def draw_document_page(builder, rng, opts, is_first, pool, images):
@@ -2083,7 +2243,131 @@ def draw_document_page(builder, rng, opts, is_first, pool, images):
         paras_done += 1
 
 
+def draw_shuffled_page(builder, rng, opts, is_first, deck):
+    """Página montada a partir da 'pilha' sorteada: frase, frase, foto, resto..."""
+    w, h = builder.width, builder.height
+    m = builder.margin
+    width = w - 2 * m
+    body = "F6" if opts.get("serif") else "F1"
+    size = float(opts.get("font_size", 11))
+    f_bold = "F7" if opts.get("serif") else "F2"
+    f_italic = "F8" if opts.get("serif") else "F3"
+    line_h = size * 1.35
+    bottom = h * 0.07 + (size * 1.4 if opts.get("footer", True) else 0)
+
+    if is_first and opts.get("headings", True):
+        tsize = size * 1.8
+        builder.text(m, builder.y, opts.get("title") or rng.choice(_TITULOS), f_bold, tsize,
+                     align="center", width=width)
+        builder.y -= tsize * 2.1
+        builder.line(m, builder.y, w - m, builder.y, (0.6, 0.6, 0.65), 0.8)
+        builder.y -= size * 1.2
+
+    figure_no = 0
+    short_fit = 0
+    guard = 0
+    while builder.y > bottom + line_h and guard < 600:
+        guard += 1
+        # na última parte da página não entra mais foto: o texto fecha a folha
+        remaining = builder.y - bottom
+        allow_images = remaining > h * 0.30
+        # só sorteia foto se houver espaço razoável; senão vai texto
+        want_image = allow_images and rng.random() < deck.image_ratio
+        piece = deck.next_piece(want_image)
+        kind, value = piece
+        if kind == "img":
+            space = builder.y - bottom - size * 3.2
+            if space < h * 0.16:
+                break
+            # tamanho variado da foto (não ocupa sempre meia página)
+            max_h = min(space, h * rng.uniform(0.22, 0.40))
+            iw, ih = value["width"], value["height"]
+            scale = min(width * rng.uniform(0.72, 1.0) / float(iw), max_h / float(ih))
+            if scale * ih < 40:
+                continue
+            offset = rng.uniform(0, max(0.0, width - iw * scale))
+            builder.image(value, m + offset, builder.y, iw * scale, ih * scale)
+            builder.y -= ih * scale + size * 0.4
+            figure_no += 1
+            if rng.random() < 0.55:
+                caption = rng.choice([
+                    "Figura %d" % figure_no,
+                    "Fig. %d" % figure_no,
+                    "Fonte: %s" % rng.choice(_EMPRESAS),
+                    "Imagem recortada %02d" % rng.randint(1, 99),
+                ])[:110]
+                for line in wrap_text(caption, f_italic, size * 0.72, width):
+                    if builder.y < bottom + line_h:
+                        break
+                    builder.text(m, builder.y, line, f_italic, size * 0.72,
+                                 align="center", width=width, rgb=(0.45, 0.45, 0.5))
+                    builder.y -= size * 1.0
+            builder.y -= size * 0.5
+            continue
+
+        lines = wrap_text(value, body, size, width)
+        if rng.random() < 0.3:
+            lines[0] = "    " + lines[0]
+        rgb = (0.08, 0.08, 0.12) if kind == "orig" else (0.38, 0.38, 0.43)
+        if builder.y - len(lines) * line_h < bottom:
+            # trecho longo não cabe: deixa para a página seguinte
+            if len(lines) > 4 and short_fit > 0:
+                break
+            short_fit += 1
+            if short_fit > 3:
+                break
+            continue
+        for line in lines:
+            builder.text(m, builder.y, line, body, size, rgb=rgb)
+            builder.y -= line_h
+        builder.y -= size * rng.uniform(0.15, 0.6)
+
+    # completa a página se sobrou muito espaço em branco
+    guard2 = 0
+    while builder.y > bottom + line_h * 3 and guard2 < 60:
+        guard2 += 1
+        _, text = deck.next_piece(False)
+        lines = wrap_text(text, body, size, width)
+        for line in lines:
+            if builder.y < bottom:
+                break
+            builder.text(m, builder.y, line, body, size, rgb=(0.1, 0.1, 0.14))
+            builder.y -= line_h
+        builder.y -= size * 0.3
+
+    if opts.get("footer", True) and opts.get("page_numbers", True):
+        builder.text(m, h - h * 0.045, "%d" % rng.randint(1, 999), "F1", size * 0.75,
+                     align="center", width=width, rgb=(0.45, 0.45, 0.5))
+
+
 def generate_document_pages(sink, opts, rng):
+    if opts.get("shuffle_mode"):
+        deck = ContentDeck(opts.get("texts"), opts.get("capture_boxes"), rng, opts)
+        for info in _image_list(opts.get("images")):
+            if not any(item.get("path") == info.get("path") for item in deck.images):
+                deck.images.append(info)
+        if not deck.fragments:
+            deck.fragments = [("rand", random_paragraph(rng)) for _ in range(6)]
+        # cada foto entra inteira e também em pedaços recortados diferentes
+        if deck.images:
+            pieces = []
+            variants = max(1, int(opts.get("crop_variants", 3)))
+            for info in deck.images:
+                pieces.append(info)
+                for _ in range(variants - 1):
+                    cropped = _crop_image(info, _image_crop_box(info, rng))
+                    if cropped:
+                        pieces.append(cropped)
+            deck.images = pieces
+        for idx in range(int(opts.get("pages", 1))):
+            size = resolve_page_size(opts.get("page_size"), rng)
+            builder = PageBuilder(size[0], size[1], margin=max(18.0, min(size) * 0.08))
+            draw_shuffled_page(builder, rng, opts, idx == 0, deck)
+            if opts.get("watermark"):
+                _watermark(builder, rng, opts["watermark"])
+            sink.add(size, builder.content(), builder.resources())
+        return sink
+
     pool = _content_pool(opts.get("texts"), rng)
     images = _image_list(opts.get("images"))
     for idx in range(int(opts.get("pages", 1))):
@@ -2125,7 +2409,7 @@ def random_size_range(rng, size_min, size_max):
 def build_text_pdfs(out_dir, opts, progress=None):
     """Gera N PDFs com textos/fotos do usuário (modo 2)."""
     files = []
-    rng = random.Random()
+    rng = random.Random(opts.get("seed"))
     total = int(opts.get("pdfs", 1))
     for idx in range(1, total + 1):
         local = dict(opts)
@@ -2727,8 +3011,9 @@ def _term_common(style, opts, max_len, is_auto):
     print("  Tamanho das páginas:")
     print("   a) A4        b) A5        c) Carta (Letter)   d) A3")
     print("   e) aleatório  f) personalizado (ex.: 10x15cm, 210x297mm, 400x600pt)")
-    size = _ask(style, "  escolha (a-f)", default="e" if is_auto else "a", max_len=max_len)
-    size = (size or "e").lower()
+    size = _ask(style, "  escolha (a-f)", default="e" if is_auto else "a", max_len=max_len,
+                allowed={"a", "b", "c", "d", "e", "f"}, allow_empty=True)
+    size = (size or ("e" if is_auto else "a")).lower()
     presets = {"a": "A4", "b": "A5", "c": "Letter", "d": "A3"}
     if size in presets:
         opts["page_size"] = presets[size]
@@ -2764,7 +3049,7 @@ def _term_common(style, opts, max_len, is_auto):
             print(style.warn("    a largura máxima deve ser maior que a mínima (20 a 600 mm)."))
         opts["size_min"] = lo * 72 / 25.4
         opts["size_max"] = hi * 72 / 25.4
-    n_pages = _ask(style, "  páginas por PDF (se for aleatório, será um número próximo)",
+    n_pages = _ask(style, "  páginas por PDF (ex.: 100, 200...)",
                    default="1", cast=int, max_len=max_len) or 1
     opts["pages"] = max(1, n_pages)
     rand_pages = _ask(style, "  variar a quantidade de páginas? (s/n)",
@@ -2785,6 +3070,27 @@ def _term_common(style, opts, max_len, is_auto):
     wm = _ask(style, "  marca d'água (ex.: CONFIDENCIAL; Enter = nenhuma)", default="",
               max_len=max_len, allow_empty=True)
     opts["watermark"] = wm or None
+    return opts
+
+
+def _term_shuffle(style, opts, max_len, is_auto=False):
+    """Perguntas do modo sorteio (cortar/misturar frases e fotos)."""
+    print()
+    print(style.bold("  Modo sorteio de conteúdo"))
+    print(style.dim("  As frases são cortadas, remontadas e repetidas; as fotos entram"))
+    print(style.dim("  inteiras e recortadas até preencher exatamente as páginas pedidas."))
+    opts["shuffle_mode"] = True
+    rec = _ask(style, "  versões recortadas de cada foto (1-6)", default="3", cast=int,
+               max_len=max_len)
+    opts["crop_variants"] = min(6, max(1, rec or 3))
+    if not is_auto:
+        mix = _ask(style, "  misturar frases aleatórias no meio? (s/n)", default="s", cast=bool,
+                   max_len=max_len)
+        opts["filler_prob"] = 0.35 if mix else 0.0
+    seed = _ask(style, "  semente do sorteio (Enter = diferente cada vez)", default="",
+                max_len=max_len, allow_empty=True)
+    if seed.isdigit():
+        opts["seed"] = int(seed)
     return opts
 
 
@@ -2814,6 +3120,12 @@ def _term_mode2(style, session, max_len):
     opts = _term_common(style, opts, max_len, is_auto=False)
     if opts is None:
         return
+    recurso = _ask(style, "  usar o modo sorteio (cortar e misturar frases/fotos)? (s/n)",
+                   default="s", cast=bool, max_len=max_len)
+    if recurso:
+        opts = _term_shuffle(style, opts, max_len)
+        if opts is None:
+            return
     try:
         files = session.run_mode2(opts)
         _term_saved(style, files, session)
@@ -3169,14 +3481,17 @@ def graphical_mode(session=None):
     o_serif = tk.BooleanVar(value=False)
     o_watermark = tk.StringVar(value="")
     o_name2 = tk.StringVar(value="documento")
+    o_shuffle = tk.BooleanVar(value=True)
+    o_crops = tk.StringVar(value="3")
+    o_filler = tk.BooleanVar(value=True)
 
     SIZE_CHOICES = list(PAGE_SIZES.keys()) + ["personalizado"]
 
     def _opts_row(parent, r):
         ttk.Label(parent, text="Quantos PDFs:").grid(row=r, column=0, sticky="w")
-        ttk.Spinbox(parent, from_=1, to=200, width=6, textvariable=o_pdfs).grid(row=r, column=1, padx=(6, 16))
+        ttk.Spinbox(parent, from_=1, to=9999, width=7, textvariable=o_pdfs).grid(row=r, column=1, padx=(6, 16))
         ttk.Label(parent, text="Páginas:").grid(row=r, column=2, sticky="w")
-        ttk.Spinbox(parent, from_=1, to=500, width=6, textvariable=o_pages).grid(row=r, column=3, padx=(6, 16))
+        ttk.Spinbox(parent, from_=1, to=9999, width=7, textvariable=o_pages).grid(row=r, column=3, padx=(6, 16))
         ttk.Label(parent, text="Nome:").grid(row=r, column=4, sticky="w")
         ttk.Entry(parent, width=18, textvariable=o_name2).grid(row=r, column=5, sticky="we")
         parent.columnconfigure(5, weight=1)
@@ -3225,6 +3540,15 @@ def graphical_mode(session=None):
 
     ttk.Button(r2, text="Tamanho…", command=open_manual_size).pack(side="left", padx=(10, 0))
 
+    r3 = ttk.LabelFrame(opts2, text="Sorteio do conteúdo", padding=6)
+    r3.grid(row=3, column=0, columnspan=6, sticky="we", pady=(8, 0))
+    ttk.Checkbutton(r3, text="Cortar e misturar frases e fotos (repete até preencher as páginas)",
+                    variable=o_shuffle).pack(side="left")
+    ttk.Checkbutton(r3, text="• misturar frases de enchimento",
+                    variable=o_filler).pack(side="left", padx=(12, 0))
+    ttk.Label(r3, text="• recortes por foto:").pack(side="left", padx=(12, 0))
+    ttk.Spinbox(r3, from_=1, to=6, width=4, textvariable=o_crops).pack(side="left")
+
     # ---------------- aba 3 ----------------
     tab3 = ttk.Frame(nb, padding=10)
     nb.add(tab3, text=" 3 · Aleatório automático ")
@@ -3248,9 +3572,9 @@ def graphical_mode(session=None):
     r = ttk.Frame(opts3)
     r.pack(fill="x")
     ttk.Label(r, text="Quantos PDFs:").grid(row=0, column=0, sticky="w")
-    ttk.Spinbox(r, from_=1, to=500, width=6, textvariable=a_pdfs).grid(row=0, column=1, padx=6)
+    ttk.Spinbox(r, from_=1, to=9999, width=7, textvariable=a_pdfs).grid(row=0, column=1, padx=6)
     ttk.Label(r, text="Páginas:").grid(row=0, column=2, sticky="w", padx=(14, 0))
-    ttk.Spinbox(r, from_=1, to=500, width=6, textvariable=a_pages).grid(row=0, column=3, padx=6)
+    ttk.Spinbox(r, from_=1, to=9999, width=7, textvariable=a_pages).grid(row=0, column=3, padx=6)
     ttk.Checkbutton(r, text="entre", variable=a_rand_pages).grid(row=0, column=4)
     ttk.Spinbox(r, from_=1, to=500, width=5, textvariable=a_pages_min).grid(row=0, column=5)
     ttk.Label(r, text="e").grid(row=0, column=6, padx=2)
@@ -3377,6 +3701,9 @@ def graphical_mode(session=None):
             texts=texts, images=list(session.images),
             serif=bool(o_serif.get()), watermark=_watermark_text(),
             filename=o_name2.get().strip() or "documento",
+            shuffle_mode=bool(o_shuffle.get()),
+            crop_variants=_int(o_crops, 3),
+            filler_prob=0.35 if o_filler.get() else 0.0,
         )
 
     def run_mode1():
@@ -3484,10 +3811,14 @@ Modos:
   --cli misturar PDF... [-p N] [-n K] [--nao-aleatorizar] [--sem-repetir]
         Sorteia N páginas dos PDFs informados e gera K arquivos.
 
-  --cli texto [--texto ARQ | --string "TXT" ...] [--foto IMG ...] [-p N] [--pdfs K]
+  --cli texto [--texto ARQ | --string "TXT" ...] [--foto IMG ...] [-p N] [--pdfs K] [--sorteio]
         Gera PDFs usando seus textos (arquivos .txt) e fotos (JPG/PNG).
         Sem --texto/--string, usa textos aleatórios.
         Também aceita uma pasta: --texto pasta/ --foto pasta/
+
+        Com --sorteio: o programa corta as frases em pedaços, remonta, repete e
+        intercala as fotos (inteiras e recortadas) até preencher exatamente N
+        páginas. Ex.: --sorteio -p 100 --pdfs 20 cria vinte PDFs de 100 páginas.
 
   --cli aleatorio [--pdfs K] [-p N] [--tamanho T] [--aleatorio-tamanho]
         Gera K PDFs com textos totalmente aleatórios.
@@ -3512,6 +3843,7 @@ Exemplos:
   python gerador_pdf.py --cli misturar a.pdf b.pdf -p 12 -n 3
   python gerador_pdf.py --cli misturar ./pdfs/ -p 8 --sem-repetir
   python gerador_pdf.py --cli texto --texto cartas.txt --foto f1.jpg --foto f2.png -p 4 --pdfs 5
+  python gerador_pdf.py --cli texto --texto cartas.txt --foto ./fotos/ --sorteio -p 100 --pdfs 20
   python gerador_pdf.py --cli aleatorio --pdfs 10 -p 3 --aleatorio-tamanho
 """
 
@@ -3531,6 +3863,12 @@ def cli_mode(args):
 
     def common_opts():
         opts = {}
+        if args.sorteio:
+            opts["shuffle_mode"] = True
+            opts["crop_variants"] = max(1, args.recortes)
+            opts["filler_prob"] = 0.0 if args.so_meu_texto else 0.35
+        if args.semente is not None:
+            opts["seed"] = args.semente
         if args.aleatorio_tamanho:
             opts["random_size"] = True
             opts["page_size"] = "aleatorio"
@@ -3566,6 +3904,12 @@ def cli_mode(args):
                                       not args.sem_repetir, out_name=args.nome)
         elif args.cli == "texto":
             opts = common_opts()
+            if args.paginas and args.paginas < 1:
+                print("erro: --paginas deve ser maior que zero.", file=sys.stderr)
+                return 2
+            if (args.pdfs or args.quantidade or 1) < 1:
+                print("erro: --pdfs deve ser maior que zero.", file=sys.stderr)
+                return 2
             opts["pdfs"] = args.pdfs or args.quantidade or 1
             opts["pages"] = args.paginas or 1
             for item in args.texto or []:
@@ -3634,6 +3978,14 @@ def main(argv=None):
     parser.add_argument("--string", action="append", help="texto direto na linha de comando")
     parser.add_argument("--foto", action="append", help="arquivo/pasta de fotos")
     parser.add_argument("--fonte-serif", action="store_true")
+    parser.add_argument("--sorteio", "--shuffle", dest="sorteio", action="store_true",
+                        help="modo sorteio: corta e mistura frases e fotos, repetindo para "
+                             "preencher quantas páginas quiser")
+    parser.add_argument("--recortes", type=int, default=3, metavar="N",
+                        help="quantas versões recortadas de cada foto usar no sorteio (padrão 3)")
+    parser.add_argument("--so-meu-texto", action="store_true",
+                        help="no sorteio, usa apenas o seu texto (sem frases aleatórias extras)")
+    parser.add_argument("--semente", type=int, help="semente do sorteio (para repetir o mesmo resultado)")
     parser.add_argument("--marca-dagua", help="texto da marca d'água")
     parser.add_argument("--nome", help="prefixo dos arquivos gerados")
     parser.add_argument("arquivos", nargs="*", help="PDFs (modo misturar) ou extras")
